@@ -17,7 +17,7 @@ NOTE: Please edit in Suggesting mode.
 
 Search results in the ChatBot service are inconsistent due to incomplete or lagging indexing of conversations. ChatBot Insights is a proposed service that will:
 
-- Collect metrics from the source database (MongoDB) and the search index.
+- Collect metrics from the source database (MongoDB) and the search index (MeiliSearch).
 - Reconcile differences between documents flagged for indexing and those actually available in the search index.
 - Generate **report snapshots** over multiple time periods.
 - Provide a view for monitoring trends and discrepancies.
@@ -26,14 +26,16 @@ Search results in the ChatBot service are inconsistent due to incomplete or lagg
 
 ## Context – What’s the problem?
 
-The ChatBot service stores conversations and messages in MongoDB. A separate search index is used for query functionality.
+The ChatBot service stores conversations and messages in MongoDB. A separate search index (MeiliSearch) is used for query functionality.
 
 Current issues include:
 
-- **Incomplete or inconsistent search indexing:** Not all documents flagged for indexing in MongoDB are actually available in the search index.
-- **Lack of visibility into metrics:** Teams currently lack insight into database growth, indexing discrepancies, and search reliability over time.
+- **Incomplete or inconsistent search indexing:** Not all documents flagged for indexing in MongoDB (`_meiliIndex: true`) are actually available in MeiliSearch.
+- **Scaling issues:** As document volume grows, indexing throughput lags and causes drift between MongoDB and MeiliSearch counts.
+- **Lack of visibility into metrics:** Teams lack systematic insight into database growth, indexing discrepancies, and search reliability over time.
+- **Split monitoring tooling:** A metrics proxy sidecar exists for MeiliSearch, and Datadog notebooks are also used, but this creates duplication and inconsistency.
 
-ChatBot Insights addresses this gap by **aggregating, reconciling, and presenting metrics** about the source database and indexed documents.
+ChatBot Insights addresses this gap by **aggregating, reconciling, and presenting metrics** about the source database and indexed documents, with eventual consolidation into a single monitoring service.
 
 ---
 
@@ -190,47 +192,6 @@ Each snapshot report captures metrics for a defined time window:
 
 ---
 
-## Automated Monthly Report Generation (Pseudocode)
-
-```python
-# Step 1: Define report period (last full month)
-report_period_start = first_day_of_last_month()
-report_period_end = last_day_of_last_month()
-
-# Step 2: Query MongoDB for metrics
-mongo_total_docs = mongodb.count_documents(
-    created_at__gte=report_period_start,
-    created_at__lte=report_period_end
-)
-mongo_indexed_flagged_docs = mongodb.count_documents(
-    created_at__gte=report_period_start,
-    created_at__lte=report_period_end,
-    _meiliIndex=True
-)
-
-# Step 3: Query Search Index (Meilisearch) for documents actually indexed
-indexed_docs_total, most_recent_indexed_doc = meilisearch.get_indexed_documents(
-    start=report_period_start,
-    end=report_period_end
-)
-
-# Step 4: Compute discrepancies
-discrepancy_count = mongo_indexed_flagged_docs - indexed_docs_total
-discrepancy_percentage = (discrepancy_count / mongo_indexed_flagged_docs) * 100
-
-# Step 5: Construct JSON snapshot
-report_snapshot = { ... }
-
-# Step 6: Upload report to S3
-s3_path = f"s3://chatbot-insights/reports/monthly/{report_period_start.year}/{report_period_start.month:02}/metrics_snapshot.json"
-s3.upload_json(report_snapshot, s3_path)
-
-# Step 7: (Optional) Log completion
-logger.info(f"Monthly report generated and uploaded to {s3_path}")
-```
-
----
-
 ## Solutions Considered
 
 | Option                    | Pros                                              | Cons                                                   |
@@ -245,60 +206,22 @@ logger.info(f"Monthly report generated and uploaded to {s3_path}")
 
 ## Future Enhancements
 
-While the initial version of ChatBot Insights focuses on generating immutable report snapshots and a basic period-based view, there are several potential enhancements that could increase the utility and analytical capabilities of the system:
-
-### 1. Trend Aggregation Across Snapshots
-
-- Support for aggregating multiple snapshots to visualize trends over time (e.g., week-over-week growth, month-over-month indexing discrepancies).
-- Could involve querying multiple JSON snapshots from S3 or directly querying MongoDB for flexible analysis.
-- Enables advanced metrics like moving averages, percentage growth, or anomaly detection.
-
-```mermaid
-flowchart TD
-    subgraph S3["S3 Snapshot Storage"]
-        A[Daily Reports]
-        B[Weekly Reports]
-        C[Monthly Reports]
-        D[Quarterly Reports]
-    end
-
-    E[Trend Aggregator Service] -->|Fetch multiple snapshots| S3
-    E --> F[Aggregate Metrics / Compute Trends]
-    F --> G[UI / Dashboard: Trend Visualization]
-
-    style S3 fill:#f9f9f9,stroke:#333,stroke-width:1px
-    style E fill:#e0f7fa,stroke:#333,stroke-width:1px
-    style F fill:#ffe0b2,stroke:#333,stroke-width:1px
-    style G fill:#dcedc8,stroke:#333,stroke-width:1px
-```
-
-### 2. Advanced Visualization Types
-
-- Line charts, heatmaps, stacked area charts for discrepancies and indexing trends.
-
-### 3. Dynamic Date Ranges and Filtering
-
-- Arbitrary date ranges and metadata-based filters.
-
-### 4. Alerting and Notifications
-
-- Threshold-based alerts for discrepancies.
-
-### 5. Index Reconciliation Automation
-
-- Automated detection and optional reindexing of missing documents.
-
-### 6. Historical Comparisons and Benchmarking
-
-- Period-to-period benchmarking for indexing performance.
+- **Trend aggregation across snapshots** (e.g. moving averages, anomaly detection).
+- **Visualization improvements** (line charts, heatmaps, stacked area charts).
+- **Dynamic date ranges and filtering.**
+- **Alerting and notifications** when discrepancies exceed thresholds.
+- **Index reconciliation automation** (detect + reindex missing documents).
+- **Historical benchmarking** across quarters and years.
 
 ---
 
 ## Next Steps
 
-1. Finalize report schema and aggregation queries for each period.
-2. Implement **fully automated report generator** to fetch metrics from MongoDB and reconcile indexed documents.
-3. Store report snapshots in S3 using structured paths.
-4. Implement retention policies using S3 lifecycle rules.
-5. Build UI/view to fetch and display reports by period.
-6. Optionally, support aggregation of multiple snapshots for trend analysis.
+1. Run MongoDB and MeiliSearch queries to collect baseline data (see separate runbook).
+2. Export results into CSV and Google Sheets for visualization.
+3. Finalize report schema and aggregation queries for each period.
+4. Implement **automated report generator**.
+5. Store report snapshots in S3 using structured paths.
+6. Implement retention policies with S3 lifecycle rules.
+7. Build UI/view to fetch and display reports by period.
+8. Support aggregation of multiple snapshots for trend analysis.

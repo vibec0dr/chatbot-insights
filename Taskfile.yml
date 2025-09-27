@@ -1,0 +1,36 @@
+# https://taskfile.dev
+
+version: "3"
+
+vars:
+  DOCKER_IMAGE: chatbot-insights
+
+tasks:
+  default:
+    cmds:
+      - task --list-all
+    silent: true
+
+  dev:
+    desc: "Run templ, Air, and Tailwind in parallel for development"
+    cmd: task -p templ-watch server-watch tailwind-watch
+
+  templ-watch:
+    desc: "Run templ generate in watch mode with live reload proxy"
+    cmds:
+      - go tool templ generate --watch --proxy="http://localhost:8080" --open-browser=true
+    silent: true
+
+  server-watch:
+    desc: "Run Air to rebuild Go server on changes"
+    cmds:
+      - air
+    silent: true
+
+  tailwind-watch:
+    desc: "Watch and build Tailwind CSS using watchman if available"
+    preconditions:
+      - sh -c "command -v tailwindcss >/dev/null 2>&1 || ./scripts/install-tailwindcss.sh"
+    cmds:
+      - tailwindcss -i ./web/styles/input.css -o ./web/styles/output.css --watch
+    silent: true
