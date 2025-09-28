@@ -1,4 +1,4 @@
-# RFC: ChatBot Insights
+# RFC: ChatBot Insights & Metrics Monitoring
 
 NOTE: Please edit in Suggesting mode.
 
@@ -11,8 +11,6 @@ NOTE: Please edit in Suggesting mode.
 | Decision date:           |       |
 | Locations to notify:     |       |
 
----
-
 ## TL;DR
 
 Search results in the ChatBot service are inconsistent due to incomplete or lagging indexing of conversations. ChatBot Insights is a proposed service that will:
@@ -21,8 +19,7 @@ Search results in the ChatBot service are inconsistent due to incomplete or lagg
 - Reconcile differences between documents flagged for indexing and those actually available in the search index.
 - Generate **report snapshots** over multiple time periods.
 - Provide a view for monitoring trends and discrepancies.
-
----
+- Provide visibility into database growth, indexing performance, and search reliability.
 
 ## Context – What’s the problem?
 
@@ -33,28 +30,24 @@ Current issues include:
 - **Incomplete or inconsistent search indexing:** Not all documents flagged for indexing in MongoDB (`_meiliIndex: true`) are actually available in MeiliSearch.
 - **Scaling issues:** As document volume grows, indexing throughput lags and causes drift between MongoDB and MeiliSearch counts.
 - **Lack of visibility into metrics:** Teams lack systematic insight into database growth, indexing discrepancies, and search reliability over time.
-- **Split monitoring tooling:** A metrics proxy sidecar exists for MeiliSearch, and Datadog notebooks are also used, but this creates duplication and inconsistency.
+- **Split monitoring tooling:** A metrics proxy sidecar exists for MeiliSearch, and Datadog notebooks are also used, creating duplication and inconsistency.
 
 ChatBot Insights addresses this gap by **aggregating, reconciling, and presenting metrics** about the source database and indexed documents, with eventual consolidation into a single monitoring service.
-
----
 
 ## Guiding Principles
 
 - Reports are **immutable snapshots**, one per aggregation period.
 - Historical reports allow trend analysis and discrepancy monitoring.
-- Trend analysis may involve aggregating multiple snapshots from storage, or querying the source database directly for custom date ranges.
+- Trend analysis may involve aggregating multiple snapshots from storage or querying the source database directly for custom date ranges.
 - The service focuses on **tracking discrepancies between documents flagged for indexing and documents actually indexed**, without duplicating search index metrics already tracked elsewhere.
 - Simplicity and cost-efficiency are prioritized; storage is primarily in S3.
 - Reports are **fully automated** and require no human interaction unless a failure occurs.
-
----
 
 ## Report Storage Path Structure
 
 Reports are stored in S3 using a **structured, predictable path**:
 
-```
+```bash
 s3://<bucket_name>/reports/<period>/<YYYY>/<MM>/<DD>/<report_type>.json
 ```
 
@@ -66,16 +59,12 @@ s3://<bucket_name>/reports/<period>/<YYYY>/<MM>/<DD>/<report_type>.json
 
 **Examples:**
 
-- Daily report (Sept 26, 2025):  
+- Daily report (Sept 26, 2025):
   `s3://chatbot-insights/reports/daily/2025/09/26/metrics_snapshot.json`
-
-- Monthly report (Aug 2025):  
+- Monthly report (Aug 2025):
   `s3://chatbot-insights/reports/monthly/2025/08/metrics_snapshot.json`
-
-- Quarterly report (Q3 2025):  
+- Quarterly report (Q3 2025):
   `s3://chatbot-insights/reports/quarterly/2025/Q3/metrics_snapshot.json`
-
----
 
 ### Suggested UI Period Mapping
 
@@ -87,8 +76,6 @@ s3://<bucket_name>/reports/<period>/<YYYY>/<MM>/<DD>/<report_type>.json
 | Specific Month   | `monthly`           | Direct mapping to monthly report path             |
 | Specific Quarter | `quarterly`         | Map quarter to monthly/quarterly path             |
 | Specific Year    | `yearly`            | Fetch yearly snapshot                             |
-
----
 
 ## Retention Policy for Reports
 
@@ -106,8 +93,6 @@ To avoid unnecessary storage costs:
 - Older snapshots can be automatically **archived to Glacier or deleted**.
 - Ensures the system remains **cheap and scalable**.
 
----
-
 ## Architecture
 
 ```mermaid
@@ -123,8 +108,6 @@ flowchart TD
 - **Report Generator**: Runs aggregation queries for the defined period, computes discrepancies, stores JSON report in S3.
 - **S3 Storage**: Holds immutable report snapshots organized by period and date.
 - **UI/View**: Fetches snapshot from S3 to display metrics; may support aggregation over multiple snapshots for trend analysis.
-
----
 
 ## Automated Scheduling and Workflow
 
@@ -147,8 +130,6 @@ flowchart TD
         I -->|No| K[Proceed as normal]
     end
 ```
-
----
 
 ## Data Model
 
@@ -178,8 +159,6 @@ Each snapshot report captures metrics for a defined time window:
 }
 ```
 
----
-
 ### Metrics Growth Table (Example)
 
 | Period    | MongoDB Documents | Indexed Flagged Docs | Indexed Documents | Discrepancy | Most Recent Indexed Document |
@@ -189,8 +168,6 @@ Each snapshot report captures metrics for a defined time window:
 | Monthly   | 320,000           | 290,000              | 270,000           | 20,000      | conv_12580                   |
 | Quarterly | 950,000           | 870,000              | 810,000           | 60,000      | conv_13012                   |
 | Yearly    | 3,500,000         | 3,200,000            | 2,950,000         | 250,000     | conv_15000                   |
-
----
 
 ## Solutions Considered
 
@@ -202,18 +179,46 @@ Each snapshot report captures metrics for a defined time window:
 
 **Decision:** Store immutable JSON snapshots in **S3**, keyed by period and date, for simplicity, cost-efficiency, and extensibility.
 
----
+## MeiliSearch Optimization & Configuration
+
+### Instance-Level Recommendations
+
+| Option               | Recommendation              | Reference                                                                                                       |
+| -------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Environment          | `production`                | [MeiliSearch Environment](https://docs.meilisearch.com/reference/features/environment.html)                     |
+| Max Indexing Memory  | ~2/3 of available RAM       | [Max Indexing Memory](https://docs.meilisearch.com/reference/features/configuration.html#max-indexing-memory)   |
+| Max Indexing Threads | Half of available CPU cores | [Max Indexing Threads](https://docs.meilisearch.com/reference/features/configuration.html#max-indexing-threads) |
+| Snapshots            | Schedule daily (`86400s`)   | [Snapshots](https://docs.meilisearch.com/reference/features/snapshots.html)                                     |
+| Logging              | `INFO`                      | [Logging](https://docs.meilisearch.com/reference/features/configuration.html#log-level)                         |
+| No Analytics         | `true`                      | [Analytics](https://docs.meilisearch.com/reference/features/configuration.html#no-analytics)                    |
+
+### Index-Level Recommendations
+
+| Setting                | Recommendation                                                           | Reference                                                                                    |
+| ---------------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| `searchableAttributes` | `["summary"]`                                                            | [Index Settings](https://docs.meilisearch.com/reference/api/settings.html)                   |
+| `displayedAttributes`  | `["_id","summary","createdAt"]`                                          | [Index Settings](https://docs.meilisearch.com/reference/api/settings.html)                   |
+| `filterableAttributes` | `["createdAt"]`                                                          | [Index Settings](https://docs.meilisearch.com/reference/api/settings.html)                   |
+| `sortableAttributes`   | `["createdAt"]`                                                          | [Index Settings](https://docs.meilisearch.com/reference/api/settings.html)                   |
+| `rankingRules`         | Default (`typo`, `words`, `proximity`, `attribute`, `sort`, `exactness`) | [Ranking Rules](https://docs.meilisearch.com/reference/api/settings.html#ranking-rules)      |
+| `typoTolerance`        | `true`                                                                   | [Typos & Search](https://docs.meilisearch.com/reference/features/search.html#typo-tolerance) |
+
+**Notes:**
+
+- Only configure fields as searchable/filterable if necessary to reduce memory usage.
+- Large datasets may require sharding indexes by time (monthly/quarterly).
+- Settings should be applied via **configuration scripts or config files** to make them repeatable and version-controlled.
+- Configuration via `config.toml` is recommended for repeatability: [https://docs.meilisearch.com/reference/features/configuration.html#configuration-file](https://docs.meilisearch.com/reference/features/configuration.html#configuration-file)
 
 ## Future Enhancements
 
-- **Trend aggregation across snapshots** (e.g. moving averages, anomaly detection).
+- **Trend aggregation across snapshots** (moving averages, anomaly detection).
 - **Visualization improvements** (line charts, heatmaps, stacked area charts).
 - **Dynamic date ranges and filtering.**
 - **Alerting and notifications** when discrepancies exceed thresholds.
 - **Index reconciliation automation** (detect + reindex missing documents).
 - **Historical benchmarking** across quarters and years.
-
----
+- Potential APM instrumentation for search query tracking.
 
 ## Next Steps
 
@@ -225,3 +230,5 @@ Each snapshot report captures metrics for a defined time window:
 6. Implement retention policies with S3 lifecycle rules.
 7. Build UI/view to fetch and display reports by period.
 8. Support aggregation of multiple snapshots for trend analysis.
+9. Apply MeiliSearch instance and index optimizations for consistent performance.
+10. Document configuration and index settings for reproducibility.
