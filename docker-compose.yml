@@ -1,6 +1,6 @@
 services:
-  mongo:
-    image: mongo
+  mongosh:
+    image: mongosh
     restart: always
     environment:
       MONGO_INITDB_ROOT_USERNAME: root
@@ -8,13 +8,13 @@ services:
     ports:
       - 27017:27017
 
-  mongo-express:
-    image: mongo-express
+  mongosh-express:
+    image: mongosh-express
     restart: always
     ports:
       - 8081:8081
     environment:
-      ME_CONFIG_MONGODB_URL: mongodb://root:example@mongo:27017/
+      ME_CONFIG_MONGODB_URL: mongodb://root:example@mongosh:27017/
       ME_CONFIG_BASICAUTH_ENABLED: true
       ME_CONFIG_BASICAUTH_USERNAME: mongoexpressuser
       ME_CONFIG_BASICAUTH_PASSWORD: mongoexpresspass

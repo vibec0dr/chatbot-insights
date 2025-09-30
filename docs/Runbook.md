@@ -126,7 +126,7 @@ curl -s "http://<meili-host>:7700/tasks?status=succeeded" | jq '.results | lengt
 
 ## 3. Cross-Checking Drift
 
-After collecting Mongo and MeiliSearch values, compute:
+After collecting mongosh and MeiliSearch values, compute:
 
 ```
 drift_count = (mongo_flagged - meili_numberOfDocuments)
@@ -156,7 +156,7 @@ echo "$DATE,$MONGO_TOTAL,$MONGO_FLAGGED,$MEILI_COUNT" >> chatbot_metrics.csv
 
 ## 5. Suggested Columns in Google Sheet
 
-| Date | Mongo Total Docs | Mongo `_meiliIndex` | Meili Indexed Docs | Drift Count | Drift % | First Doc Date | Last Doc Date | Failed Tasks | Succeeded Tasks |
+| Date | mongosh Total Docs | mongosh `_meiliIndex` | Meili Indexed Docs | Drift Count | Drift % | First Doc Date | Last Doc Date | Failed Tasks | Succeeded Tasks |
 | ---- | ---------------- | ------------------- | ------------------ | ----------- | ------- | -------------- | ------------- | ------------ | --------------- |
 
 ---
@@ -164,7 +164,7 @@ echo "$DATE,$MONGO_TOTAL,$MONGO_FLAGGED,$MEILI_COUNT" >> chatbot_metrics.csv
 ## 6. Frequency
 
 - **Daily**: append one line to CSV (Section 4).
-- **Weekly/Monthly**: aggregate within Mongo/Google Sheets.
+- **Weekly/Monthly**: aggregate within mongosh/Google Sheets.
 - **Quarterly/Yearly**: optional roll-ups for trend analysis.
 
 ---

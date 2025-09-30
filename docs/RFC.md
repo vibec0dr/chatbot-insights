@@ -140,7 +140,7 @@ Each snapshot report captures metrics for a defined time window:
   "period": "monthly",
   "time_window_start": "2025-08-01T00:00:00Z",
   "time_window_end": "2025-08-31T23:59:59Z",
-  "mongo": {
+  "mongosh": {
     "total_documents": 320000,
     "indexed_flagged_documents": 290000
   },

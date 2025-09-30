@@ -4,15 +4,15 @@ import (
 	"context"
 	"time"
 
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
-	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
-	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
+	"go.mongodb.org/mongosh-driver/v2/mongosh"
+	"go.mongodb.org/mongosh-driver/v2/mongosh/options"
+	"go.mongodb.org/mongosh-driver/v2/mongosh/readpref"
+	"go.mongodb.org/mongosh-driver/v2/mongosh/writeconcern"
 )
 
 // MongoClient is the concrete type returned to consumers.
 type MongoClient struct {
-	*mongo.Client
+	*mongosh.Client
 }
 
 // NewClient creates a new MongoDB client with default settings.
@@ -25,7 +25,7 @@ func NewClient(ctx context.Context, uri string) (*MongoClient, error) {
 		SetConnectTimeout(10 * time.Second).
 		SetServerSelectionTimeout(5 * time.Second)
 
-	client, err := mongo.Connect(opts)
+	client, err := mongosh.Connect(opts)
 	if err != nil {
 		return nil, err
 	}

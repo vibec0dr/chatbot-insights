@@ -7,43 +7,56 @@ import (
 	"os"
 	"time"
 
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
-	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
+	"github.com/meilisearch/meilisearch-go"
+	"go.mongodb.org/mongosh-driver/v2/bson"
+	"go.mongodb.org/mongosh-driver/v2/mongosh"
+	"go.mongodb.org/mongosh-driver/v2/mongosh/options"
+	"go.mongodb.org/mongosh-driver/v2/mongosh/readpref"
+	"go.mongodb.org/mongosh-driver/v2/mongosh/writeconcern"
 )
 
+type Movie struct {
+	ID          string    `bson:"_id" json:"id"`
+	Title       string    `bson:"title" json:"title"`
+	Year        int       `bson:"year" json:"year"`
+	Rating      float64   `bson:"rating" json:"rating"`
+	Genres      []string  `bson:"genres" json:"genres"`
+	MeiliIndex  bool      `bson:"_meiliIndex" json:"-"`
+	IndexedDate time.Time `bson:"indexedDate,omitempty" json:"-"`
+}
+
+// getenv returns the value of the environment variable named by the key,
+// or def if the variable is not present or empty.
+func getenv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
 func main() {
-	var uri string
-	if uri = os.Getenv("MONGODB_URI"); uri == "" {
-		log.Fatal("You must set your 'MONGODB_URI' environment variable. See\n\t https://docs.mongodb.com/drivers/go/current/usage-examples/")
+	uri := os.Getenv("MONGODB_URI")
+	if uri == "" {
+		log.Fatal("You must set your 'MONGODB_URI' environment variable")
 	}
 
-	// Set up the connection options
+	// mongosh options
 	serverAPI := options.ServerAPI(options.ServerAPIVersion1)
 	opts := options.Client().
 		ApplyURI(uri).
 		SetServerAPIOptions(serverAPI).
-		// Enable compression
 		SetCompressors([]string{"zlib", "snappy", "zstd"}).
-		// Connection pool settings
 		SetMinPoolSize(5).
 		SetMaxPoolSize(100).
-		// Connection timeout settings
 		SetConnectTimeout(10 * time.Second).
 		SetServerSelectionTimeout(5 * time.Second).
-		// Keep idle connections alive
 		SetMaxConnIdleTime(30 * time.Second).
-		// Enable retries for better reliability
 		SetRetryWrites(true).
-		// Write concern for better reliability
 		SetWriteConcern(writeconcern.Majority()).
-		SetWriteConcern(mongo.WriteConcern{}.SetW("majority")).
-		// Read preference for better performance
-		SetReadPreference(mongo.ReadPref{}.Primary())
+		SetReadPreference(readpref.Nearest())
 
-	// Creates a new client and connects to the server
-	client, err := mongo.Connect(context.TODO(), opts)
+	// Connect to mongosh
+	client, err := mongosh.Connect(opts)
 	if err != nil {
 		panic(err)
 	}
@@ -53,10 +66,54 @@ func main() {
 		}
 	}()
 
-	// Sends a ping to confirm a successful connection
-	var result bson.M
-	if err := client.Database("admin").RunCommand(context.TODO(), bson.D{{"ping", 1}}).Decode(&result); err != nil {
+	// Test ping
+	if err := client.Database("admin").
+		RunCommand(context.TODO(), bson.D{{Key: "ping", Value: 1}}).
+		Err(); err != nil {
 		panic(err)
 	}
-	fmt.Println("Pinged your deployment. You successfully connected to MongoDB!")
+	fmt.Println("✅ Connected to MongoDB")
+
+	// --- Fetch documents from mongosh ---
+	coll := client.Database("LibreChat").Collection("messages")
+
+	// Example filter: only documents that should be indexed (_meiliIndex: true)
+	// and only last 7 days
+	oneWeekAgo := time.Now().Add(-7 * 24 * time.Hour)
+	filter := bson.M{
+		"_meiliIndex": true,
+		"indexedDate": bson.M{"$gte": oneWeekAgo},
+	}
+
+	cur, err := coll.Find(context.TODO(), filter)
+	if err != nil {
+		log.Fatalf("mongosh find failed: %v", err)
+	}
+	defer cur.Close(context.TODO())
+
+	var movies []Movie
+	if err := cur.All(context.TODO(), &movies); err != nil {
+		log.Fatalf("Cursor decode failed: %v", err)
+	}
+
+	fmt.Printf("📦 Got %d documents from MongoDB\n", len(movies))
+
+	// --- Setup Meilisearch client ---
+	host := getenv("MEILI_HOST", "http://localhost:7700")
+	apiKey := os.Getenv("MEILI_API_KEY")
+	meilisearchClient := meilisearch.New(host, meilisearch.WithAPIKey(apiKey))
+
+	indexUid := "movies"
+	index := meilisearchClient.Index(indexUid)
+
+	// Index only if we found docs
+	if len(movies) > 0 {
+		taskInfo, err := index.AddDocuments(movies, meilisearch.StringPtr("id"))
+		if err != nil {
+			log.Fatalf("Failed to index documents: %v", err)
+		}
+		fmt.Printf("🚀 Indexing task: %+v\n", taskInfo)
+	}
+
+	fmt.Println("✅ Done")
 }
