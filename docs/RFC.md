@@ -1,234 +1,159 @@
-# RFC: ChatBot Insights & Metrics Monitoring
-
-NOTE: Please edit in Suggesting mode.
-
-| Authors:                 |       |
-| :----------------------- | :---- |
-| Comments requested from: |       |
-| Comments due date:       |       |
-| Current State:           | Draft |
-| Decision:                |       |
-| Decision date:           |       |
-| Locations to notify:     |       |
+# RFC: Conversational Search with MongoDB and Meilisearch
 
 ## TL;DR
 
-Search results in the ChatBot service are inconsistent due to incomplete or lagging indexing of conversations. ChatBot Insights is a proposed service that will:
+Our conversational search system drifts out of sync, grows without limits, risks exhausting RAM and crashing, and lacks effective observability.
 
-- Collect metrics from the source database (MongoDB) and the search index (MeiliSearch).
-- Reconcile differences between documents flagged for indexing and those actually available in the search index.
-- Generate **report snapshots** over multiple time periods.
-- Provide a view for monitoring trends and discrepancies.
-- Provide visibility into database growth, indexing performance, and search reliability.
+## 1. Context and Problem Statement
 
-## Context – What’s the problem?
+LibreChat relies on MongoDB for storing all conversations and messages. Meilisearch provides the search layer, holding a secondary index of those documents optimized for fast queries. A document in MongoDB carries a `MeiliIndex` flag. When set to true, that document is expected to appear in Meilisearch. MongoDB is the canonical source of truth, while Meilisearch is a derivative, queryable projection.
 
-The ChatBot service stores conversations and messages in MongoDB. A separate search index (MeiliSearch) is used for query functionality.
+This model is fragile at scale. Drift accumulates between the two systems. Some documents expected in Meilisearch are missing; others persist long after they should have been removed. Updates may be delayed or lost. Rebuilding an index exposes users to incomplete results because ingestion takes hours while new documents continue to arrive. By the time a rebuild completes, the index may already be out of date.
 
-Current issues include:
+Growth compounds this fragility. Meilisearch stores its indexes in memory, and by default indexes all fields. As the dataset grows, memory pressure increases linearly until pods crash. With no lifecycle policies in place, the index expands unchecked.
 
-- **Incomplete or inconsistent search indexing:** Not all documents flagged for indexing in MongoDB (`_meiliIndex: true`) are actually available in MeiliSearch.
-- **Scaling issues:** As document volume grows, indexing throughput lags and causes drift between MongoDB and MeiliSearch counts.
-- **Lack of visibility into metrics:** Teams lack systematic insight into database growth, indexing discrepancies, and search reliability over time.
-- **Split monitoring tooling:** A metrics proxy sidecar exists for MeiliSearch, and Datadog notebooks are also used, creating duplication and inconsistency.
+Observability is weak. Meilisearch exposes statistics about its internal operations, but operators lack visibility into how many documents are eligible for indexing in MongoDB, how many are present in Meilisearch, or how quickly either is growing. Today, checks require manual shell access, ad hoc queries, and secret handling. This complexity discourages routine monitoring, leaving drift and growth unnoticed until failure.
 
-ChatBot Insights addresses this gap by **aggregating, reconciling, and presenting metrics** about the source database and indexed documents, with eventual consolidation into a single monitoring service.
+Without intervention, the system will drift further out of sync, scale unpredictably, and crash under memory pressure. This RFC proposes a framework to restore reliability: timestamp-based drift reconciliation, lean schema configuration, zero-downtime indexing, lifecycle policies, growth monitoring, observability tooling, and operator runbooks.
 
-## Guiding Principles
+## 2. Drift Detection
 
-- Reports are **immutable snapshots**, one per aggregation period.
-- Historical reports allow trend analysis and discrepancy monitoring.
-- Trend analysis may involve aggregating multiple snapshots from storage or querying the source database directly for custom date ranges.
-- The service focuses on **tracking discrepancies between documents flagged for indexing and documents actually indexed**, without duplicating search index metrics already tracked elsewhere.
-- Simplicity and cost-efficiency are prioritized; storage is primarily in S3.
-- Reports are **fully automated** and require no human interaction unless a failure occurs.
+Drift is the divergence between MongoDB’s truth and Meilisearch’s index. It takes several forms: missing documents, stale documents, or documents incorrectly included. Preventing drift is central to reliable search.
 
-## Report Storage Path Structure
+Meilisearch does not store timestamps, so reconciliation must depend on MongoDB. The approach is timestamp-based delta capture. When reindexing, the system records the start time `T₀`. The snapshot load ingests all documents with `MeiliIndex: true` and `updatedAt <= T₀`. Once complete, the system queries MongoDB for documents with `updatedAt > T₀` and reconciles them into the new index. Documents that have been toggled off or deleted since `T₀` are explicitly removed. This ensures that the new index is consistent with MongoDB at the moment it becomes active.
 
-Reports are stored in S3 using a **structured, predictable path**:
+Example MongoDB queries illustrate this pattern:
+
+```javascript
+// Snapshot query: load all documents eligible as of T₀
+db.conversations.find({
+  MeiliIndex: true,
+  updatedAt: { $lte: ISODate("2025-10-02T12:00:00Z") }
+})
+
+// Delta query: capture changes since T₀
+db.conversations.find({
+  MeiliIndex: true,
+  updatedAt: { $gt: ISODate("2025-10-02T12:00:00Z") }
+})
+
+// Identify documents toggled off since T₀
+db.conversations.find({
+  MeiliIndex: false,
+  updatedAt: { $gt: ISODate("2025-10-02T12:00:00Z") }
+})
+```
+
+Drift must also be monitored continuously. Counts provide a coarse signal:
 
 ```bash
-s3://<bucket_name>/reports/<period>/<YYYY>/<MM>/<DD>/<report_type>.json
+curl -s "http://localhost:7700/indexes/conversations/stats" \
+  -H "Authorization: Bearer $MEILI_KEY"
 ```
 
-- `<period>` → `daily`, `weekly`, `monthly`, `quarterly`, `yearly`
-- `<YYYY>` → 4-digit year
-- `<MM>` → 2-digit month (`01`–`12`)
-- `<DD>` → 2-digit day (`01`–`31`)
-- `<report_type>` → descriptive report name (e.g., `metrics_snapshot`)
+More robust checks sample document IDs from MongoDB and ensure they exist in Meilisearch. Strongest checks hash the searchable fields in MongoDB and compare them with what Meilisearch returns. These checks must run automatically and persist reports as immutable JSON, allowing operators to analyze drift trends over time.
 
-**Examples:**
+## 3. Index Configuration and Schema
 
-- Daily report (Sept 26, 2025):
-  `s3://chatbot-insights/reports/daily/2025/09/26/metrics_snapshot.json`
-- Monthly report (Aug 2025):
-  `s3://chatbot-insights/reports/monthly/2025/08/metrics_snapshot.json`
-- Quarterly report (Q3 2025):
-  `s3://chatbot-insights/reports/quarterly/2025/Q3/metrics_snapshot.json`
+Meilisearch defaults to indexing every field. This is wasteful and unsustainable at scale. Only necessary fields should be searchable or filterable. For conversations, the key searchable fields are `title`, `participants`, and possibly `lastMessage`. Timestamps may be filterable but not indexed for text. For messages, `body` is the core searchable field, with `sender` and `timestamp` filterable if required.
 
-### Suggested UI Period Mapping
+Configuration is set via Meilisearch’s API. For example:
 
-| UI Option        | Storage Path Period | Notes                                             |
-| ---------------- | ------------------- | ------------------------------------------------- |
-| Last 1 day       | `daily`             | Fetch yesterday’s snapshot                        |
-| Last 7 days      | `daily`             | Aggregate last 7 daily snapshots                  |
-| Last 30 days     | `monthly`           | Use monthly snapshot or aggregate daily snapshots |
-| Specific Month   | `monthly`           | Direct mapping to monthly report path             |
-| Specific Quarter | `quarterly`         | Map quarter to monthly/quarterly path             |
-| Specific Year    | `yearly`            | Fetch yearly snapshot                             |
-
-## Retention Policy for Reports
-
-To avoid unnecessary storage costs:
-
-| Period    | Retention Duration | Notes                                           |
-| --------- | ------------------ | ----------------------------------------------- |
-| Daily     | 30 days            | Keep the last month of daily snapshots          |
-| Weekly    | 12 weeks           | Keep approximately 3 months of weekly snapshots |
-| Monthly   | 24 months          | Keep 2 years of monthly snapshots               |
-| Quarterly | 5 years            | Keep 5 years of quarterly snapshots             |
-| Yearly    | 10 years           | Keep 10 years of yearly snapshots               |
-
-- Retention policies are implemented using **S3 lifecycle rules**.
-- Older snapshots can be automatically **archived to Glacier or deleted**.
-- Ensures the system remains **cheap and scalable**.
-
-## Architecture
-
-```mermaid
-flowchart TD
-    A[MongoDB] -->|Aggregate query for period| B[Report Generator]
-    B --> C[S3 Storage: Immutable JSON Report]
-    D[UI/View] -->|Fetch report by S3 path| C
+```bash
+curl -X PATCH "http://localhost:7700/indexes/conversations/settings" \
+  -H "Authorization: Bearer $MEILI_KEY" \
+  -H "Content-Type: application/json" \
+  --data '{
+    "searchableAttributes": ["title", "participants", "lastMessage"],
+    "filterableAttributes": ["timestamp"]
+  }'
 ```
 
-**Explanation:**
+Restricting fields keeps the index lean, reducing memory pressure and speeding queries. Because schema changes require full reindexing, they must be coupled with the zero-downtime strategy described below.
 
-- **MongoDB**: Source of messages and conversations, including `_meiliIndex: true` flags.
-- **Report Generator**: Runs aggregation queries for the defined period, computes discrepancies, stores JSON report in S3.
-- **S3 Storage**: Holds immutable report snapshots organized by period and date.
-- **UI/View**: Fetches snapshot from S3 to display metrics; may support aggregation over multiple snapshots for trend analysis.
+## 4. Zero-Downtime Indexing
 
-## Automated Scheduling and Workflow
+Reindexing in place exposes users to disruption. To prevent this, indexing must follow a dual-index swap model.
 
-```mermaid
-flowchart TD
-    subgraph Scheduler[Automated Scheduler]
-        A[Daily Trigger] -->|Aggregate daily metrics| B[Report Generator]
-        C[Weekly Trigger] -->|Aggregate weekly metrics| B
-        D[Monthly Trigger] -->|Aggregate monthly metrics| B
-        E[Quarterly Trigger] -->|Aggregate quarterly metrics| B
-        F[Yearly Trigger] -->|Aggregate yearly metrics| B
-    end
+The system creates a new index, for example `conversations_new`. At time `T₀`, it ingests all eligible documents. After ingestion, it reconciles deltas: all documents updated after `T₀` are upserted, and invalidated documents are removed. Once the new index is fully reconciled, it is validated. Validation checks counts, ID presence, and sampled content.
 
-    B -->|Generate JSON snapshot| G[S3 Storage: Immutable Report]
-    G -->|Fetch by period| H[UI / Dashboard]
+If validation succeeds, Meilisearch’s atomic swap API is used to replace the active index:
 
-    subgraph Alerts[Failure Handling]
-        B -.-> I[Error?]
-        I -->|Yes| J[Send alert / log for operator]
-        I -->|No| K[Proceed as normal]
-    end
+```bash
+curl -X POST "http://localhost:7700/swap-indexes" \
+  -H "Authorization: Bearer $MEILI_KEY" \
+  -H "Content-Type: application/json" \
+  --data '[
+    { "indexes": ["conversations_new", "conversations"] }
+  ]'
 ```
 
-## Data Model
+The swap is instantaneous and invisible to clients. The old index remains available for rollback. If validation fails, no swap occurs. This guarantees zero downtime, even for large reindexes.
 
-Each snapshot report captures metrics for a defined time window:
+## 5. Data Lifecycle and Retention
 
-```json
-{
-  "period": "monthly",
-  "time_window_start": "2025-08-01T00:00:00Z",
-  "time_window_end": "2025-08-31T23:59:59Z",
-  "mongosh": {
-    "total_documents": 320000,
-    "indexed_flagged_documents": 290000
-  },
-  "indexed_documents": {
-    "total": 270000,
-    "most_recent_indexed": "conv_12580"
-  },
-  "discrepancy": {
-    "count_difference": 20000,
-    "percentage_difference": 6.9
-  },
-  "metadata": {
-    "notes": "Monthly report snapshot; all values computed at end of period",
-    "tags": ["search", "indexing", "metrics"]
-  }
-}
+Indexes must be bounded. Meilisearch holds its data in memory, so unbounded growth guarantees a crash. Lifecycle policies constrain the active index without losing canonical data.
+
+A simple retention rule might include only the last six months of data:
+
+```javascript
+db.conversations.find({
+  MeiliIndex: true,
+  updatedAt: { $gte: ISODate("2025-04-02T00:00:00Z") }
+})
 ```
 
-### Metrics Growth Table (Example)
+Older documents remain in MongoDB and can be archived elsewhere, but they are excluded from the active index. Lifecycle enforcement keeps indexes within memory budgets and ensures predictable operation.
 
-| Period    | MongoDB Documents | Indexed Flagged Docs | Indexed Documents | Discrepancy | Most Recent Indexed Document |
-| --------- | ----------------- | -------------------- | ----------------- | ----------- | ---------------------------- |
-| Daily     | 10,200            | 9,500                | 8,700             | 800         | conv_12345                   |
-| Weekly    | 71,000            | 65,000               | 60,500            | 4,500       | conv_12420                   |
-| Monthly   | 320,000           | 290,000              | 270,000           | 20,000      | conv_12580                   |
-| Quarterly | 950,000           | 870,000              | 810,000           | 60,000      | conv_13012                   |
-| Yearly    | 3,500,000         | 3,200,000            | 2,950,000         | 250,000     | conv_15000                   |
+## 6. Growth Metrics and Observability
 
-## Solutions Considered
+To plan capacity and detect drift, growth must be measured systematically. MongoDB aggregations show how many documents are created daily:
 
-| Option                    | Pros                                              | Cons                                                   |
-| ------------------------- | ------------------------------------------------- | ------------------------------------------------------ |
-| Store snapshots in S3     | Cheap, simple, immutable, easy to fetch by period | Trend analysis requires aggregating multiple snapshots |
-| Store in SQL              | Queryable, supports analytics                     | Adds infrastructure and cost; more complex             |
-| Store in flat files / Git | Versioned, simple                                 | Not scalable; non-cloud-native                         |
+```javascript
+db.conversations.aggregate([
+  { $match: { createdAt: { $gte: ISODate("2025-09-30T00:00:00Z") } } },
+  { $group: {
+      _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+      count: { $sum: 1 }
+    } }
+])
+```
 
-**Decision:** Store immutable JSON snapshots in **S3**, keyed by period and date, for simplicity, cost-efficiency, and extensibility.
+Meilisearch provides counts and index size:
 
-## MeiliSearch Optimization & Configuration
+```bash
+curl -s "http://localhost:7700/indexes/conversations/stats" \
+  -H "Authorization: Bearer $MEILI_KEY"
+```
 
-### Instance-Level Recommendations
+Today, producing these metrics requires multiple tools and steps. A CLI observability tool should wrap these queries, hiding the complexity. With a single command, an operator could see growth, drift, and validation reports. These should be archived daily as immutable JSON to build a long-term record of system health.
 
-| Option               | Recommendation              | Reference                                                                                                       |
-| -------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| Environment          | `production`                | [MeiliSearch Environment](https://docs.meilisearch.com/reference/features/environment.html)                     |
-| Max Indexing Memory  | ~2/3 of available RAM       | [Max Indexing Memory](https://docs.meilisearch.com/reference/features/configuration.html#max-indexing-memory)   |
-| Max Indexing Threads | Half of available CPU cores | [Max Indexing Threads](https://docs.meilisearch.com/reference/features/configuration.html#max-indexing-threads) |
-| Snapshots            | Schedule daily (`86400s`)   | [Snapshots](https://docs.meilisearch.com/reference/features/snapshots.html)                                     |
-| Logging              | `INFO`                      | [Logging](https://docs.meilisearch.com/reference/features/configuration.html#log-level)                         |
-| No Analytics         | `true`                      | [Analytics](https://docs.meilisearch.com/reference/features/configuration.html#no-analytics)                    |
+## 7. Monitoring and Verification
 
-### Index-Level Recommendations
+Monitoring is essential for early warning. MongoDB must be checked for how many documents are eligible for indexing. Meilisearch must be checked for how many are actually indexed. Memory usage of the Meilisearch pods must be tracked continuously.
 
-| Setting                | Recommendation                                                           | Reference                                                                                    |
-| ---------------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
-| `searchableAttributes` | `["summary"]`                                                            | [Index Settings](https://docs.meilisearch.com/reference/api/settings.html)                   |
-| `displayedAttributes`  | `["_id","summary","createdAt"]`                                          | [Index Settings](https://docs.meilisearch.com/reference/api/settings.html)                   |
-| `filterableAttributes` | `["createdAt"]`                                                          | [Index Settings](https://docs.meilisearch.com/reference/api/settings.html)                   |
-| `sortableAttributes`   | `["createdAt"]`                                                          | [Index Settings](https://docs.meilisearch.com/reference/api/settings.html)                   |
-| `rankingRules`         | Default (`typo`, `words`, `proximity`, `attribute`, `sort`, `exactness`) | [Ranking Rules](https://docs.meilisearch.com/reference/api/settings.html#ranking-rules)      |
-| `typoTolerance`        | `true`                                                                   | [Typos & Search](https://docs.meilisearch.com/reference/features/search.html#typo-tolerance) |
+Verification routines confirm correctness. During rebuilds, validation ensures the new index is complete before swapping. In production, scheduled verification samples documents. For example, MongoDB may provide a random eligible document:
 
-**Notes:**
+```javascript
+db.conversations.aggregate([
+  { $match: { MeiliIndex: true } },
+  { $sample: { size: 1 } }
+])
+```
 
-- Only configure fields as searchable/filterable if necessary to reduce memory usage.
-- Large datasets may require sharding indexes by time (monthly/quarterly).
-- Settings should be applied via **configuration scripts or config files** to make them repeatable and version-controlled.
-- Configuration via `config.toml` is recommended for repeatability: [https://docs.meilisearch.com/reference/features/configuration.html#configuration-file](https://docs.meilisearch.com/reference/features/configuration.html#configuration-file)
+That ID can then be retrieved from Meilisearch to confirm presence. Any discrepancies must be logged and trigger alerts. These checks provide assurance that indexing remains reliable.
 
-## Future Enhancements
+## 8. Operational Principles
 
-- **Trend aggregation across snapshots** (moving averages, anomaly detection).
-- **Visualization improvements** (line charts, heatmaps, stacked area charts).
-- **Dynamic date ranges and filtering.**
-- **Alerting and notifications** when discrepancies exceed thresholds.
-- **Index reconciliation automation** (detect + reindex missing documents).
-- **Historical benchmarking** across quarters and years.
-- Potential APM instrumentation for search query tracking.
+Operations must be structured around clear, repeatable procedures. Reindexing must follow the dual-index pattern with validation and swap. Drift detection must be automated and archived. Rollback must be supported via old index retention. Lifecycle enforcement must run on schedule. Operators must have reliable, documented processes to execute these steps safely.
 
 ## Next Steps
 
-1. Run MongoDB and MeiliSearch queries to collect baseline data (see separate runbook).
-2. Export results into CSV and Google Sheets for visualization.
-3. Finalize report schema and aggregation queries for each period.
-4. Implement **automated report generator**.
-5. Store report snapshots in S3 using structured paths.
-6. Implement retention policies with S3 lifecycle rules.
-7. Build UI/view to fetch and display reports by period.
-8. Support aggregation of multiple snapshots for trend analysis.
-9. Apply MeiliSearch instance and index optimizations for consistent performance.
-10. Document configuration and index settings for reproducibility.
+Define lean schemas for conversations and messages. Implement the zero-downtime rebuild pipeline with timestamp-based delta capture. Build the observability CLI to expose drift and growth metrics. Enforce lifecycle policies to cap index size. Extend monitoring to cover MongoDB and Meilisearch with alerts. Draft and test operator runbooks for reindexing, drift remediation, and rollback. With these foundations, the system will scale predictably, resist drift, and remain stable under load.
+
+## References
+
+1. [Meilisearch: Indexes API](https://www.meilisearch.com/docs/reference/api/indexes)
+2. [Meilisearch: Zero-downtime index deployment](https://www.meilisearch.com/blog/zero-downtime-index-deployment)
+3. [Meilisearch: Asynchronous operations](https://www.meilisearch.com/docs/learn/async/asynchronous_operations)
+4. [MongoDB Manual: Aggregation pipeline](https://www.mongodb.com/docs/manual/core/aggregation-pipeline/)
