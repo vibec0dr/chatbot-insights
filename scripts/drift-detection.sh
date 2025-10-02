@@ -38,7 +38,7 @@ echo "MongoDB messages exported: $(wc -l < "$MONGO_MESSAGES_FILE")"
 echo "Fetching MongoDB conversations (last 6 months, _meiliIndex: true)..."
 docker exec -i "$MONGO_CONTAINER" mongosh "$MONGO_DB" --quiet --eval '
   const sixMonthsAgo = new Date();
-  sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+  sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 7);
   db.conversations.find({
     _meiliIndex: true,
     createdAt: { $gte: sixMonthsAgo }
